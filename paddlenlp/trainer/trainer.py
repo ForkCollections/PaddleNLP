@@ -79,6 +79,7 @@ from ..data import (
     DataCollatorWithPadding,
     DistDataLoader,
     default_data_collator,
+    init_dataloader_comm_group,
 )
 from ..peft import LoRAModel, PrefixModelForCausalLM, VeRAModel
 
@@ -113,7 +114,6 @@ from ..utils.log import logger
 from .argparser import strtobool
 from .integrations import get_reporting_integration_callbacks
 from .plugins.timer import RuntimeTimer, get_timers, set_timers
-from .plugins.unified_checkpoint import UnifiedCheckpointHandler
 from .trainer_callback import (
     CallbackHandler,
     DefaultFlowCallback,
@@ -142,8 +142,10 @@ from .trainer_utils import (  # set_hyrbid_parallel_seed,
     set_seed,
     should_skip_data,
     speed_metrics,
+    split_parallel_config,
 )
 from .training_args import TrainingArguments
+from .unified_checkpoint import UnifiedCheckpointHandler
 from .utils import reshard as reshard_util
 from .utils.async_save import AsyncSaver
 from .utils.helper import (  # nested_truncate,
@@ -421,6 +423,10 @@ class Trainer:
 
             model.apply(fn)
 
+        self._pp_data_group = None
+        if self.args.pipeline_parallel_degree > 1 and self.args.distributed_dataloader:
+            self._pp_data_group = init_dataloader_comm_group()
+
         default_label_names = (
             ["start_positions", "end_positions"]
             if "QusetionAnswering" in type(self.model).__name__ or "UIE" in type(self.model).__name__
@@ -587,7 +593,6 @@ class Trainer:
                 if use_unified_checkpoint:
                     self.unified_checkpoint_handler.load_unified_checkpoint(
                         self.model,
-                        self.optimizer,
                         resume_from_checkpoint,
                     )
                     logger.info(f"Loading model from {resume_from_checkpoint} using unified checkpoint.")
@@ -1230,7 +1235,6 @@ class Trainer:
                 if self.args.unified_checkpoint:
                     self.unified_checkpoint_handler.load_unified_checkpoint(
                         self.model,
-                        self.optimizer,
                         self.state.best_model_checkpoint,
                     )
                     if self.args.sharding_parallel_degree > 1 or self.args.data_parallel_degree > 1:
@@ -1278,7 +1282,6 @@ class Trainer:
         if self.args.unified_checkpoint:
             self.unified_checkpoint_handler.load_unified_checkpoint(
                 self.model,
-                self.optimizer,
                 self.state.best_model_checkpoint,
             )
             if self.args.sharding_parallel_degree > 1 or self.args.data_parallel_degree > 1:
@@ -1507,6 +1510,7 @@ class Trainer:
             train_dataset = self._remove_unused_columns(train_dataset, description="training")
         _DataLoader = DistDataLoader if self.args.distributed_dataloader else DataLoader
 
+        additional_configs = {}
         if is_iterable_dataset:  # For iterable dataset
             if self.args.dataset_world_size > 1 and train_dataset is not None:
                 train_dataset = IterableDatasetShard(
@@ -1519,9 +1523,7 @@ class Trainer:
 
             if self.args.distributed_dataloader:
                 logger.info("Training using DistDataLoader.")
-                additional_configs = {"is_iterable_dataset": True}
-            else:
-                additional_configs = {}
+                additional_configs = {"is_iterable_dataset": True, "pp_data_group": self._pp_data_group}
             return _DataLoader(
                 train_dataset,
                 batch_size=self.args.per_device_train_batch_size,
@@ -1533,11 +1535,13 @@ class Trainer:
             train_sampler = self._get_train_sampler()
             if self.args.distributed_dataloader:
                 logger.info("Training using DistDataLoader.")
+                additional_configs = {"pp_data_group": self._pp_data_group}
             return _DataLoader(
                 train_dataset,
                 batch_sampler=train_sampler,
                 collate_fn=self.data_collator,
                 num_workers=self.args.dataloader_num_workers,
+                **additional_configs,
             )
 
     def _get_eval_sampler(self, eval_dataset: Dataset):
@@ -1552,20 +1556,13 @@ class Trainer:
                 drop_last=False,
             )
         else:
-            drop_last = False
-            if self.args.pipeline_parallel_degree > 1:
-                drop_last = True
-                logger.warning(
-                    "In parallel mode, the batch_size is strictly checked. set DistributedBatchSampler drop_last=True."
-                )
-
             return DistributedBatchSampler(
                 eval_dataset,
                 num_replicas=self.args.dataset_world_size,
                 rank=self.args.dataset_rank,
                 batch_size=self.args.per_device_eval_batch_size,
                 shuffle=False,
-                drop_last=drop_last,
+                drop_last=False,
             )
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
@@ -1593,6 +1590,7 @@ class Trainer:
             eval_dataset = self._remove_unused_columns(eval_dataset, description="evaluation")
         _DataLoader = DistDataLoader if self.args.distributed_dataloader else DataLoader
 
+        additional_configs = {}
         if is_iterable_dataset:
             if self.args.dataset_world_size > 1 and eval_dataset is not None:
                 eval_dataset = IterableDatasetShard(
@@ -1602,11 +1600,10 @@ class Trainer:
                     num_processes=self.args.dataset_world_size,
                     process_index=self.args.dataset_rank,
                 )
+
             if self.args.distributed_dataloader:
                 logger.info("Eval using DistDataLoader.")
-                additional_configs = {"eval": True, "is_iterable_dataset": True}
-            else:
-                additional_configs = {}
+                additional_configs = {"eval": True, "is_iterable_dataset": True, "pp_data_group": self._pp_data_group}
             return _DataLoader(
                 eval_dataset,
                 batch_size=self.args.per_device_eval_batch_size,
@@ -1618,9 +1615,7 @@ class Trainer:
             eval_sampler = self._get_eval_sampler(eval_dataset)
             if self.args.distributed_dataloader:
                 logger.info("Eval using DistDataLoader.")
-                additional_configs = {"eval": True}
-            else:
-                additional_configs = {}
+                additional_configs = {"eval": True, "pp_data_group": self._pp_data_group}
             return _DataLoader(
                 eval_dataset,
                 batch_sampler=eval_sampler,
@@ -1653,6 +1648,7 @@ class Trainer:
             test_dataset = self._remove_unused_columns(test_dataset, description="test")
         _DataLoader = DistDataLoader if self.args.distributed_dataloader else DataLoader
 
+        additional_config = {}
         if is_iterable_dataset:
             if self.args.dataset_world_size > 1 and test_dataset is not None:
                 test_dataset = IterableDatasetShard(
@@ -1665,9 +1661,7 @@ class Trainer:
 
             if self.args.distributed_dataloader:
                 logger.info("Test using DistDataLoader.")
-                additional_config = {"eval": True, "is_iterable_dataset": True}
-            else:
-                additional_config = {}
+                additional_config = {"eval": True, "is_iterable_dataset": True, "pp_data_group": self._pp_data_group}
             return _DataLoader(
                 test_dataset,
                 batch_size=self.args.per_device_eval_batch_size * self.world_size,
@@ -1679,9 +1673,7 @@ class Trainer:
             test_sampler = self._get_eval_sampler(test_dataset)
             if self.args.distributed_dataloader:
                 logger.info("Test using DistDataLoader.")
-                additional_config = {"eval": True}
-            else:
-                additional_config = {}
+                additional_config = {"eval": True, "pp_data_group": self._pp_data_group}
             # We use the same batch_size as for eval.
             return _DataLoader(
                 test_dataset,
@@ -1991,6 +1983,14 @@ class Trainer:
                 self.optimizer = mix_precision_utils.MixPrecisionOptimizer(self.optimizer)
             self.optimizer = fleet.distributed_optimizer(self.optimizer)
 
+            if (
+                hasattr(self.args, "enable_sharding_comm_overlap")
+                and self.args.enable_sharding_comm_overlap
+                and self.args.unified_checkpoint
+                and "split_param" in split_parallel_config(self.args.sharding_parallel_config)
+            ):
+                model.register_sharding_comm_overlap_hook(self.optimizer)
+
         # No pipeline mode, sharding only
         if not in_pipeline_parallel_mode and in_sharding_parallel_mode:
             # Sharded DDP!
@@ -2299,7 +2299,7 @@ class Trainer:
         if output_dir is None:
             output_dir = self.args.output_dir
 
-        if PREFIX_CHECKPOINT_DIR in output_dir:
+        if PREFIX_CHECKPOINT_DIR in os.path.split(output_dir)[-1]:
             signal_dir = os.path.join(self.args.output_signal_dir, os.path.split(output_dir)[-1])
         else:
             signal_dir = self.args.output_signal_dir
@@ -2597,7 +2597,7 @@ class Trainer:
         # signal_dir is used for asynchronous saving situations.
         signal_dir = self.args.output_signal_dir
         if self.args.unified_checkpoint and "async_save" in self.args.unified_checkpoint_config:
-            if PREFIX_CHECKPOINT_DIR in output_dir:
+            if PREFIX_CHECKPOINT_DIR in os.path.split(output_dir)[-1]:
                 signal_dir = os.path.join(signal_dir, os.path.split(output_dir)[-1])
             os.makedirs(signal_dir, exist_ok=True)
             logger.info(f"Saving model checkpoint finish signal to {signal_dir}")
@@ -2617,9 +2617,11 @@ class Trainer:
                 "ignore_save_lr_and_optim": self.args.ignore_save_lr_and_optim,
                 "skip_save_model_weight": "skip_save_model_weight" in self.args.unified_checkpoint_config,
             }
-            if os.path.exists(os.path.join(signal_dir, "async_save_info.json")):  # afs cannot overwrite
-                os.remove(os.path.join(signal_dir, "async_save_info.json"))
-            with open(os.path.join(signal_dir, "async_save_info.json"), "w") as f:
+            if os.path.exists(
+                os.path.join(self.args.output_signal_dir, "async_save_info.json")
+            ):  # afs cannot overwrite
+                os.remove(os.path.join(self.args.output_signal_dir, "async_save_info.json"))
+            with open(os.path.join(self.args.output_signal_dir, "async_save_info.json"), "w") as f:
                 json.dump(save_info, f)
 
         if self.args.should_save:
@@ -2762,9 +2764,15 @@ class Trainer:
                 else:
                     opt_state_dict = None
             else:
+                model = self.model
+                if (
+                    hasattr(self.args, "enable_sharding_comm_overlap")
+                    and self.args.enable_sharding_comm_overlap
+                    and "split_param" in split_parallel_config(self.args.sharding_parallel_config)
+                ):
+                    model = self.model_wrapped
                 opt_state_dict = self.unified_checkpoint_handler.load_unified_optimizer(
-                    args=self.args,
-                    model=self.model,
+                    model=model,
                     optimizer=self.optimizer,
                     resume_from_checkpoint=checkpoint,
                 )
@@ -3185,6 +3193,14 @@ class Trainer:
             else:
                 labels = None
             inputs = inputs.pop("input_ids")
+        # consider no drop_last case
+        model_config_backup = model.micro_batch_size, model.accumulate_steps
+        if isinstance(inputs, tuple):
+            actual_batch_size = inputs[0].shape[0]
+        else:
+            actual_batch_size = inputs.shape[0]
+        model.micro_batch_size = 1
+        model.accumulate_steps = actual_batch_size
 
         with paddle.no_grad():
             if has_labels:
@@ -3194,6 +3210,7 @@ class Trainer:
                 loss = loss.mean().detach()
             else:
                 raise ValueError("pipeline mode eval need label!")
+        model.micro_batch_size, model.accumulate_steps = model_config_backup
 
         return (loss, None, labels)
 
